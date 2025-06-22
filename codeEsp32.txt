@@ -1,0 +1,201 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+
+// TRIAC Control Pins
+const int zeroCrossPin = 4;     // GPIO4 (can be changed)
+const int triacPin = 5;         // GPIO5 
+const int potPin = 36;          // ADC1_CH0 (VP pin)
+
+// IR Speed Sensor
+const int irSensorPin = 34;     // GPIO34 (ADC1_CH6)
+const float circumference = 0.2; // Wheel circumference in meters (adjust as needed)
+const int pulsesPerRevolution = 20; // Number of slots in encoder wheel
+
+// WiFi Credentials
+const char* ssid = "YourSSID";
+const char* password = "YourPassword";
+
+// Web Server
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+// Shared Variables
+volatile bool zeroDetected = false;
+volatile float frequency = 50.0;         // Default to 50Hz
+volatile unsigned long lastZC = 0;
+volatile unsigned long lastPeriod = 0;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Motor Speed Measurement
+volatile unsigned long pulseCount = 0;
+unsigned long lastPulseTime = 0;
+float currentSpeed = 0; // in RPM
+float alpha = 0;
+
+// HTML Page
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Motor Control</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+        .data { font-size: 24px; margin: 20px; }
+        .value { font-weight: bold; color: #2c3e50; }
+    </style>
+</head>
+<body>
+    <h1>ESP32 Motor Control Dashboard</h1>
+    <div class="data">
+        Motor Speed: <span id="speed" class="value">0</span> RPM
+    </div>
+    <div class="data">
+        Firing Angle: <span id="alpha" class="value">0</span>°
+    </div>
+    <div class="data">
+        AC Frequency: <span id="freq" class="value">0</span> Hz
+    </div>
+    <script>
+        var websocket = new WebSocket('ws://' + window.location.hostname + ':81/');
+        websocket.onmessage = function(event) {
+            var data = JSON.parse(event.data);
+            document.getElementById('speed').textContent = data.speed.toFixed(1);
+            document.getElementById('alpha').textContent = data.alpha.toFixed(1);
+            document.getElementById('freq').textContent = data.freq.toFixed(1);
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// IR Sensor Interrupt Handler
+void IRAM_ATTR pulseCounter() {
+    pulseCount++;
+}
+
+// Zero Crossing Interrupt Handler
+void IRAM_ATTR zeroCrossingISR() {
+    portENTER_CRITICAL_ISR(&timerMux);
+    unsigned long currentZC = micros();
+    if (lastZC != 0) {
+        lastPeriod = currentZC - lastZC;
+        frequency = 500000.0 / lastPeriod;
+        zeroDetected = true;
+    }
+    lastZC = currentZC;
+    portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+// WebSocket Event Handler
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    switch(type) {
+        case WStype_DISCONNECTED:
+            Serial.printf("[%u] Disconnected!\n", num);
+            break;
+        case WStype_CONNECTED:
+            {
+                IPAddress ip = webSocket.remoteIP(num);
+                Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+            }
+            break;
+        case WStype_TEXT:
+            // Handle incoming messages if needed
+            break;
+    }
+}
+
+// Handle Root Web Request
+void handleRoot() {
+    server.send(200, "text/html", htmlPage);
+}
+
+void setup() {
+    // Initialize serial communication
+    Serial.begin(115200);
+    
+    // Set up TRIAC control pins
+    pinMode(triacPin, OUTPUT);
+    digitalWrite(triacPin, LOW);
+    pinMode(zeroCrossPin, INPUT_PULLUP);
+    
+    // Configure ADC for potentiometer
+    analogReadResolution(12);      // ESP32 has 12-bit ADC
+    analogSetAttenuation(ADC_11db); // 0-3.3V range
+
+    // Set up IR speed sensor
+    pinMode(irSensorPin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(irSensorPin), pulseCounter, RISING);
+
+    // Attach zero crossing interrupt
+    attachInterrupt(digitalPinToInterrupt(zeroCrossPin), zeroCrossingISR, RISING);
+
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    Serial.println("Connecting to WiFi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    // Start web server
+    server.on("/", handleRoot);
+    server.begin();
+
+    // Start WebSocket server
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+}
+
+void loop() {
+    server.handleClient();
+    webSocket.loop();
+
+    // Calculate motor speed every second
+    static unsigned long lastSpeedCalc = 0;
+    if (millis() - lastSpeedCalc >= 1000) {
+        noInterrupts();
+        unsigned long pulses = pulseCount;
+        pulseCount = 0;
+        interrupts();
+
+        // Calculate RPM: (pulses / pulsesPerRevolution) * 60 seconds
+        currentSpeed = (pulses * 60.0) / pulsesPerRevolution;
+        lastSpeedCalc = millis();
+
+        // Send data to all WebSocket clients
+        String json = "{\"speed\":" + String(currentSpeed) + 
+                      ",\"alpha\":" + String(alpha) + 
+                      ",\"freq\":" + String(frequency) + "}";
+        webSocket.broadcastTXT(json);
+
+        Serial.printf("Speed: %.1f RPM | Alpha: %.1f° | Freq: %.1f Hz\n", 
+                     currentSpeed, alpha, frequency);
+    }
+
+    // TRIAC control logic
+    if (zeroDetected) {
+        portENTER_CRITICAL(&timerMux);
+        zeroDetected = false;
+        portEXIT_CRITICAL(&timerMux);
+        
+        // Read 12-bit potentiometer (0-100 degrees)
+        int potValue = analogRead(potPin);
+        alpha = map(potValue, 0, 4095, 0, 100);
+        
+        // Phase control calculation
+        unsigned long alphaDelay = alpha * (1000000/(2*frequency*180));
+        
+        // ESP32-optimized delay
+        unsigned long triggerTime = micros() + alphaDelay;
+        while (micros() < triggerTime) {} // Busy wait for precision
+        
+        digitalWrite(triacPin, HIGH);
+        delayMicroseconds(100);    // TRIAC gate pulse
+        digitalWrite(triacPin, LOW);
+    }
+}
